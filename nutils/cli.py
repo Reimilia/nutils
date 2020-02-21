@@ -28,6 +28,11 @@ from . import long_version, warnings, matrix
 import sys, inspect, os, time, signal, subprocess, contextlib, traceback, pathlib, html, functools, pdb, stringly, textwrap, typing, treelog, collections
 
 try:
+  import resource
+except ImportError:
+  resource = None
+
+try:
   Level = treelog.proto.Level
 except AttributeError: # treelog version < 1.0b6
   Level = collections.namedtuple('Level', ['debug', 'info', 'user', 'warning', 'error'])(0,1,2,3,4)
@@ -113,31 +118,41 @@ def _traceback(richoutput, postmortem, exit):
     if exit:
       raise SystemExit(0)
 
-class _timer:
-  def __init__(self):
-    self.t0 = time.perf_counter()
-  def __str__(self):
-    seconds = int(time.perf_counter() - self.t0)
-    minutes, seconds = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    return '{}:{:02d}:{:02d}'.format(hours, minutes, seconds)
+def _format(uri, t0, width):
+  items = []
+  if resource:
+    items.append(('memory', '{:,}M'.format(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024)))
+  seconds = int(time.perf_counter() - t0)
+  minutes, seconds = divmod(seconds, 60)
+  hours, minutes = divmod(minutes, 60)
+  items.append(('elapsed', '{}:{:02d}:{:02d}'.format(hours, minutes, seconds)))
+  left = 'writing log to ' + uri
+  right = ' | '.join(': '.join(item) for item in items)
+  if len(left) + len(right) >= width:
+    right = ' | '.join(value for key, value in items)
+    if len(left) + len(right) >= width:
+      left = uri
+      if len(left) + len(right) >= width:
+        right = ''
+        if len(left) > width:
+          left = '...' + uri[3-width:]
+  return '\033[2m' + left + right.rjust(width - len(left))
 
 @contextlib.contextmanager
-def _status(uri, stickybar):
-  if stickybar:
+def _status(uri, bottombar):
+  if bottombar:
     try:
-      import stickybar
+      import bottombar
     except ModuleNotFoundError:
-      stickybar = False
-  timer = _timer()
-  if stickybar:
-    bar = lambda running: '{0} [{1}] {2}'.format(uri, 'RUNNING' if running else 'STOPPED', timer)
-    with stickybar.activate(bar, update=1):
+      bottombar = False
+  try:
+    if bottombar:
+      with bottombar.BottomBar(uri, time.perf_counter(), format=_format, interval=1):
+        yield
+    else:
+      print('opened log at', uri)
       yield
-  else:
-    print('opened log at', uri)
-    yield
-    print('elapsed', timer)
+  finally:
     print('log written to', uri)
 
 def _load_rcfile(path):
@@ -301,21 +316,20 @@ def setup(scriptname: str,
     consolellog = treelog.FilterLog(consolellog, minlevel=tuple(Level)[5-verbose])
   htmllog = _htmllog(outdir, scriptname, kwargs)
 
-  with htmllog, treelog.set(treelog.TeeLog(consolellog, htmllog)), \
+  with htmllog, \
+       _status(outuri+'/'+htmllog.filename, bottombar=richoutput), \
+       treelog.set(treelog.TeeLog(consolellog, htmllog)), \
        _traceback(richoutput=richoutput, postmortem=pdb, exit=gracefulexit), \
        warnings.via(treelog.warning), \
        _cache.enable(os.path.join(outdir, cachedir)) if cache else _cache.disable(), \
        _parallel.maxprocs(nprocs), \
        matrix, \
-       _status(outuri+'/'+htmllog.filename, stickybar=richoutput), \
        _signal_handler(signal.SIGINT, functools.partial(_breakpoint, richoutput)):
 
     treelog.info('nutils v{}'.format(_version()))
     treelog.info('start', time.ctime())
-    try:
-      yield
-    finally:
-      treelog.info('finish', time.ctime())
+    yield
+    treelog.info('finish', time.ctime())
 
 SVGLOGO = '''\
 <svg style="vertical-align: middle;" width="32" height="32" xmlns="http://www.w3.org/2000/svg">
